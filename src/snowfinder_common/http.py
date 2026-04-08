@@ -19,7 +19,6 @@ def download_file(
     url: str,
     dest_path: str,
     *,
-    verbose: bool = False,
     max_retries: int = 3,
     retry_delay_s: float = 2.0,
     timeout_s: float = 60.0,
@@ -31,15 +30,15 @@ def download_file(
     ``False`` is returned — a :class:`~snowfinder_common.exceptions.FetchError`
     is **not** raised so that callers can treat missing files as optional.
 
+    Progress messages are emitted at ``DEBUG`` level; control visibility via
+    ``LOG_LEVEL`` env var or ``configure_logging(verbose=True)``.
+
     Parameters
     ----------
     url:
         The URL to download.
     dest_path:
         Local filesystem path where the downloaded content will be written.
-    verbose:
-        When ``True``, emit DEBUG-level progress messages (filename, size).
-        When ``False`` only warnings and errors are logged.
     max_retries:
         Maximum number of download attempts (including the first attempt).
     retry_delay_s:
@@ -63,7 +62,7 @@ def download_file(
 
     for attempt in range(max_retries):
         try:
-            if verbose and attempt == 0:
+            if attempt == 0:
                 logger.debug("Downloading %s …", filename)
 
             resp = requests.get(url, timeout=timeout_s, stream=True)
@@ -78,9 +77,8 @@ def download_file(
                 for chunk in resp.iter_content(chunk_size=1024 * 1024):
                     fh.write(chunk)
 
-            if verbose:
-                size_mb = os.path.getsize(dest_path) / (1024 * 1024)
-                logger.debug("Downloaded %s (%.1f MB)", filename, size_mb)
+            size_mb = os.path.getsize(dest_path) / (1024 * 1024)
+            logger.debug("Downloaded %s (%.1f MB)", filename, size_mb)
 
             return True
 

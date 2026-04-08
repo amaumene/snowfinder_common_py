@@ -24,9 +24,9 @@ from contextlib import contextmanager
 from collections.abc import Generator
 from typing import Self
 
-import psycopg2
-import psycopg2.extensions
-from psycopg2.extras import DictCursor
+import psycopg
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
 from .exceptions import DatabaseError
 
@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 
 class Database:
-    """PostgreSQL database interface.
+    """PostgreSQL database interface backed by a connection pool.
 
     The caller is responsible for providing a valid ``database_url``; there is
     no implicit fallback to environment variables.  This keeps the class
@@ -45,69 +45,80 @@ class Database:
     database_url:
         A libpq connection string or DSN URL, e.g.
         ``"postgresql://user:pass@host:5432/dbname"``.
+    min_size:
+        Minimum number of connections in the pool (default 1).
+    max_size:
+        Maximum number of connections in the pool (default 5).
     """
 
-    def __init__(self, database_url: str) -> None:
+    def __init__(self, database_url: str, *, min_size: int = 1, max_size: int = 5) -> None:
         if not database_url:
             raise DatabaseError(
                 "database_url is required and must not be empty.",
                 context={"database_url": database_url},
             )
         self._database_url = database_url
-        self._conn: psycopg2.extensions.connection | None = None
+        self._min_size = min_size
+        self._max_size = max_size
+        self._pool: ConnectionPool | None = None
 
     # ------------------------------------------------------------------
     # Connection lifecycle
     # ------------------------------------------------------------------
 
     def connect(self) -> None:
-        """Open the database connection (idempotent if already open)."""
-        if self._conn is None or self._conn.closed:
+        """Open the connection pool (idempotent if already open)."""
+        if self._pool is None or self._pool.closed:
             try:
-                self._conn = psycopg2.connect(self._database_url)
-                logger.debug("Database connection established.")
-            except psycopg2.Error as exc:
+                self._pool = ConnectionPool(
+                    conninfo=self._database_url,
+                    min_size=self._min_size,
+                    max_size=self._max_size,
+                    kwargs={"row_factory": dict_row},
+                )
+                logger.debug("Database connection pool established.")
+            except psycopg.Error as exc:
                 raise DatabaseError(
                     f"Failed to connect to database: {exc}",
                     context={"url_prefix": self._database_url[:30]},
                 ) from exc
 
     def close(self) -> None:
-        """Close the database connection (idempotent if already closed)."""
-        if self._conn is not None and not self._conn.closed:
-            self._conn.close()
-            logger.debug("Database connection closed.")
+        """Close the connection pool (idempotent if already closed)."""
+        if self._pool is not None and not self._pool.closed:
+            self._pool.close()
+            logger.debug("Database connection pool closed.")
 
     # ------------------------------------------------------------------
     # Cursor context manager
     # ------------------------------------------------------------------
 
     @contextmanager
-    def cursor(self) -> Generator[DictCursor, None, None]:
-        """Yield a ``DictCursor``, committing on success or rolling back on error.
+    def cursor(self) -> Generator[psycopg.Cursor, None, None]:
+        """Yield a dict-row cursor, committing on success or rolling back on error.
 
         Rolls back the current transaction and logs a warning if an exception
         is raised inside the ``with`` block, then re-raises the exception.
 
         Yields
         ------
-        psycopg2.extras.DictCursor
+        psycopg.Cursor
+            A cursor whose rows are returned as dicts.
         """
         self.connect()
-        assert self._conn is not None  # guaranteed by connect()
-        cur: DictCursor = self._conn.cursor(cursor_factory=DictCursor)
-        try:
-            yield cur
-            self._conn.commit()
-        except Exception:
-            logger.warning(
-                "Exception inside cursor block — rolling back transaction.",
-                exc_info=True,
-            )
-            self._conn.rollback()
-            raise
-        finally:
-            cur.close()
+        assert self._pool is not None  # guaranteed by connect()
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                try:
+                    yield cur
+                    conn.commit()
+                except Exception:
+                    logger.warning(
+                        "Exception inside cursor block — rolling back transaction.",
+                        exc_info=True,
+                    )
+                    conn.rollback()
+                    raise
 
     # ------------------------------------------------------------------
     # Health check
@@ -132,7 +143,7 @@ class Database:
     # ------------------------------------------------------------------
 
     def __enter__(self) -> Self:
-        """Open connection and return self."""
+        """Open connection pool and return self."""
         self.connect()
         return self
 
@@ -142,7 +153,7 @@ class Database:
         exc_val: BaseException | None,
         exc_tb: object,
     ) -> None:
-        """Close connection on exit (exceptions propagate normally)."""
+        """Close connection pool on exit (exceptions propagate normally)."""
         self.close()
 
     # ------------------------------------------------------------------
@@ -152,5 +163,5 @@ class Database:
     def __repr__(self) -> str:
         # Truncate URL to avoid leaking credentials in logs/tracebacks.
         url_preview = self._database_url[:40] + ("…" if len(self._database_url) > 40 else "")
-        connected = self._conn is not None and not self._conn.closed
+        connected = self._pool is not None and not self._pool.closed
         return f"Database(url={url_preview!r}, connected={connected})"

@@ -1,1 +1,0 @@
-# snowfinder_common_py

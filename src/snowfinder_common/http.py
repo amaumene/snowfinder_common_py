@@ -1,7 +1,7 @@
 """Shared HTTP utilities for snowfinder services.
 
 Provides a robust ``download_file()`` helper with retry logic and
-structured logging, extracted from the MSM fetcher in snowfinder-predictor.
+structured logging, extracted from the MSM fetcher in snowfinder_predictor.
 """
 
 import logging

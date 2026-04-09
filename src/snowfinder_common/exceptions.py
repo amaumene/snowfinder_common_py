@@ -14,7 +14,7 @@ class SnowfinderError(Exception):
 
     def __init__(self, message: str, context: dict | None = None) -> None:
         super().__init__(message)
-        self.context: dict = context or {}
+        self.context: dict = context if context is not None else {}
 
     def __repr__(self) -> str:
         ctx = f", context={self.context!r}" if self.context else ""

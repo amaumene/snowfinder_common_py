@@ -25,6 +25,7 @@ class TestRunServiceSuccess:
         monkeypatch.setenv("DATABASE_URL", "postgresql://localhost/test")
         pipeline_fn = MagicMock()
         mock_db_class, mock_db_instance = _make_mock_db_class()
+        args_instance = None
 
         with (
             patch("snowfinder_common.cli.load_dotenv"),
@@ -32,8 +33,9 @@ class TestRunServiceSuccess:
             patch("snowfinder_common.cli.configure_logging"),
         ):
             run_service("myservice", pipeline_fn, db_class=mock_db_class)
+            args_instance = pipeline_fn.call_args.args[1]
 
-        pipeline_fn.assert_called_once_with(mock_db_instance)
+        pipeline_fn.assert_called_once_with(mock_db_instance, args_instance)
 
     def test_instantiates_db_with_database_url(self, monkeypatch):
         monkeypatch.setenv("DATABASE_URL", "postgresql://localhost/mydb")

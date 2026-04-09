@@ -106,7 +106,8 @@ class Database:
             A cursor whose rows are returned as dicts.
         """
         self.connect()
-        assert self._pool is not None  # guaranteed by connect()
+        if self._pool is None:
+            raise ValueError("Database connection pool was not initialized after connect().")
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
                 try:

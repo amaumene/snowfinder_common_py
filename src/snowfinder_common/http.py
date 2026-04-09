@@ -6,6 +6,7 @@ structured logging, extracted from the MSM fetcher in snowfinder_predictor.
 
 import logging
 import os
+import tempfile
 import time
 
 import requests
@@ -61,21 +62,29 @@ def download_file(
     filename = url.split("/")[-1] or url
 
     for attempt in range(max_retries):
+        temp_path: str | None = None
         try:
             if attempt == 0:
                 logger.debug("Downloading %s …", filename)
 
-            resp = requests.get(url, timeout=timeout_s, stream=True)
+            dest_dir = os.path.dirname(dest_path) or "."
+            with tempfile.NamedTemporaryFile(mode="wb", delete=False, dir=dest_dir) as tmp_fh:
+                temp_path = tmp_fh.name
 
-            if resp.status_code == 404:
-                logger.debug("Not found (HTTP 404): %s", url)
-                return False
+                with requests.get(url, timeout=timeout_s, stream=True) as resp:
+                    if resp.status_code == 404:
+                        logger.debug("Not found (HTTP 404): %s", url)
+                        os.unlink(temp_path)
+                        return False
 
-            resp.raise_for_status()
+                    resp.raise_for_status()
 
-            with open(dest_path, "wb") as fh:
-                for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                    fh.write(chunk)
+                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            tmp_fh.write(chunk)
+
+            os.rename(temp_path, dest_path)
+            temp_path = None
 
             size_mb = os.path.getsize(dest_path) / (1024 * 1024)
             logger.debug("Downloaded %s (%.1f MB)", filename, size_mb)
@@ -86,6 +95,14 @@ def download_file(
             # Non-404 HTTP errors — log and retry
             logger.warning(
                 "HTTP error on attempt %d/%d for %s: %s",
+                attempt + 1,
+                max_retries,
+                url,
+                exc,
+            )
+        except requests.RequestException as exc:
+            logger.warning(
+                "Download error on attempt %d/%d for %s: %s",
                 attempt + 1,
                 max_retries,
                 url,
@@ -105,11 +122,17 @@ def download_file(
                 url,
                 exc,
             )
+        finally:
+            if temp_path is not None and os.path.exists(temp_path):
+                os.unlink(temp_path)
 
         if attempt < max_retries - 1:
             delay = retry_delay_s * (attempt + 1)
             logger.debug("Retrying in %.1f s …", delay)
             time.sleep(delay)
+
+    if os.path.exists(dest_path):
+        os.unlink(dest_path)
 
     logger.error("Download failed after %d attempts: %s", max_retries, url)
     return False

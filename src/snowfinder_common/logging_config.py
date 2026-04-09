@@ -30,6 +30,7 @@ _VALID_LEVELS: dict[str, int] = {
     "INFO": logging.INFO,
     "WARNING": logging.WARNING,
     "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
 }
 
 

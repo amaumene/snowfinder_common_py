@@ -11,9 +11,17 @@ import time
 
 import requests
 
-from .exceptions import FetchError
-
 logger = logging.getLogger(__name__)
+
+
+def _validate_retry_config(max_retries: int, retry_delay_s: float, timeout_s: float) -> None:
+    """Validate download retry configuration values."""
+    if max_retries < 1:
+        raise ValueError("max_retries must be at least 1")
+    if retry_delay_s <= 0:
+        raise ValueError("retry_delay_s must be positive")
+    if timeout_s <= 0:
+        raise ValueError("timeout_s must be positive")
 
 
 def download_file(
@@ -59,6 +67,7 @@ def download_file(
         Only raised for unexpected programming errors (e.g. ``dest_path``
         directory does not exist).  Network failures are returned as ``False``.
     """
+    _validate_retry_config(max_retries, retry_delay_s, timeout_s)
     filename = url.split("/")[-1] or url
 
     for attempt in range(max_retries):
@@ -83,7 +92,7 @@ def download_file(
                         if chunk:
                             tmp_fh.write(chunk)
 
-            os.rename(temp_path, dest_path)
+            os.replace(temp_path, dest_path)
             temp_path = None
 
             size_mb = os.path.getsize(dest_path) / (1024 * 1024)
@@ -108,13 +117,7 @@ def download_file(
                 url,
                 exc,
             )
-        except OSError as exc:
-            # Filesystem error writing dest_path — this is a programming error
-            raise FetchError(
-                f"Cannot write to destination path {dest_path!r}: {exc}",
-                context={"url": url, "dest_path": dest_path},
-            ) from exc
-        except Exception as exc:  # noqa: BLE001
+        except (OSError, TimeoutError) as exc:
             logger.warning(
                 "Download error on attempt %d/%d for %s: %s",
                 attempt + 1,
@@ -123,16 +126,16 @@ def download_file(
                 exc,
             )
         finally:
-            if temp_path is not None and os.path.exists(temp_path):
-                os.unlink(temp_path)
+            if temp_path is not None:
+                import contextlib
+
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(temp_path)
 
         if attempt < max_retries - 1:
             delay = retry_delay_s * (attempt + 1)
             logger.debug("Retrying in %.1f s …", delay)
             time.sleep(delay)
-
-    if os.path.exists(dest_path):
-        os.unlink(dest_path)
 
     logger.error("Download failed after %d attempts: %s", max_retries, url)
     return False

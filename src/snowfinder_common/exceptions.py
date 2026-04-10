@@ -12,9 +12,9 @@ class SnowfinderError(Exception):
     so callers can inspect failure details programmatically.
     """
 
-    def __init__(self, message: str, context: dict | None = None) -> None:
+    def __init__(self, message: str, context: dict[str, object] | None = None) -> None:
         super().__init__(message)
-        self.context: dict = context if context is not None else {}
+        self.context: dict[str, object] = dict(context) if context else {}
 
     def __repr__(self) -> str:
         ctx = f", context={self.context!r}" if self.context else ""

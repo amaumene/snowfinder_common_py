@@ -46,7 +46,7 @@ def run_service(
         Human-readable service name for help text and logging.
     pipeline_fn:
         Pipeline function accepting ``(db, args)``.  The ``args`` namespace
-        contains at least ``verbose`` and ``database_url``, plus any extra
+        contains at least ``verbose`` and ``database_path``, plus any extra
         arguments registered via *setup_parser*.
     db_class:
         Database subclass to instantiate (default: common ``Database``).
@@ -59,9 +59,9 @@ def run_service(
     parser = argparse.ArgumentParser(description=f"SnowFinder {service_name.title()}")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     parser.add_argument(
-        "--database-url",
-        default=os.getenv("DATABASE_URL"),
-        help="PostgreSQL connection URL",
+        "--database-path",
+        default=os.getenv("DATABASE_PATH"),
+        help="Path to SQLite database file",
     )
 
     if setup_parser is not None:
@@ -69,20 +69,23 @@ def run_service(
 
     args = parser.parse_args()
 
+    if args.database_path is not None:
+        args.database_path = args.database_path.strip()
+
     configure_logging(verbose=args.verbose)
 
-    if not args.database_url:
-        logger.error("DATABASE_URL is required (env var or --database-url flag)")
+    if not args.database_path:
+        logger.error("DATABASE_PATH is required (env var or --database-path flag)")
         sys.exit(1)
 
-    start = time.time()
+    start = time.monotonic()
 
     try:
-        with db_class(args.database_url) as db:
+        with db_class(args.database_path) as db:
             pipeline_fn(db, args)
-    except Exception as e:
-        logger.error("%s failed: %s", service_name.title(), e, exc_info=True)
+    except Exception as exc:
+        logger.error("%s failed: %s", service_name.title(), exc, exc_info=True)
         sys.exit(1)
 
-    elapsed = time.time() - start
+    elapsed = time.monotonic() - start
     logger.info("%s completed in %.1fs", service_name.title(), elapsed)

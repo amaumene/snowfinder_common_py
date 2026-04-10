@@ -1,150 +1,168 @@
-"""Shared PostgreSQL database interface for snowfinder services.
+"""Shared SQLite database interface for snowfinder services.
 
 Usage::
 
     from snowfinder_common.database import Database
 
     # As a context manager (recommended):
-    with Database(database_url) as db:
+    with Database(database_path) as db:
         with db.cursor() as cur:
             cur.execute("SELECT 1")
 
     # Manual lifecycle:
-    db = Database(database_url)
+    db = Database(database_path)
     db.connect()
     try:
         with db.cursor() as cur:
-            cur.execute("SELECT now()")
+            cur.execute("SELECT 1")
     finally:
         db.close()
 """
 
 import logging
+import sqlite3
+import threading
 from contextlib import contextmanager
 from collections.abc import Generator
 from typing import Self
-
-import psycopg
-from psycopg import sql
-from psycopg.rows import dict_row
-from psycopg_pool import ConnectionPool
 
 from .exceptions import DatabaseError
 
 logger = logging.getLogger(__name__)
 
 
-class Database:
-    """PostgreSQL database interface backed by a connection pool.
+def _dict_factory(cursor: sqlite3.Cursor, row: tuple) -> dict:
+    """Row factory that returns rows as dicts keyed by column name."""
+    fields = [column[0] for column in cursor.description]
+    return dict(zip(fields, row))
 
-    The caller is responsible for providing a valid ``database_url``; there is
+
+class Database:
+    """SQLite database interface.
+
+    The caller is responsible for providing a valid ``database_path``; there is
     no implicit fallback to environment variables.  This keeps the class
     side-effect-free and easy to test.
 
     Parameters
     ----------
-    database_url:
-        A libpq connection string or DSN URL, e.g.
-        ``"postgresql://user:pass@host:5432/dbname"``.
-    min_size:
-        Minimum number of connections in the pool (default 1).
-    max_size:
-        Maximum number of connections in the pool (default 5).
+    database_path:
+        Path to the SQLite database file, e.g. ``"./snowfinder.db"``.
     """
 
-    def __init__(self, database_url: str, *, min_size: int = 1, max_size: int = 5) -> None:
-        if not database_url:
+    def __init__(self, database_path: str) -> None:
+        if not database_path:
             raise DatabaseError(
-                "database_url is required and must not be empty.",
-                context={"database_url": database_url},
+                "database_path is required and must not be empty.",
+                context={"database_path": database_path},
             )
-        self._database_url = database_url
-        self._min_size = min_size
-        self._max_size = max_size
-        self._pool: ConnectionPool | None = None
+        self._database_path = database_path
+        self._conn: sqlite3.Connection | None = None
+        self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Connection lifecycle
     # ------------------------------------------------------------------
 
     def connect(self) -> None:
-        """Open the connection pool (idempotent if already open)."""
-        if self._pool is None or self._pool.closed:
-            try:
-                self._pool = ConnectionPool(
-                    conninfo=self._database_url,
-                    min_size=self._min_size,
-                    max_size=self._max_size,
-                    kwargs={"row_factory": dict_row},
-                )
-                logger.debug("Database connection pool established.")
-            except psycopg.Error as exc:
-                raise DatabaseError(
-                    f"Failed to connect to database: {exc}",
-                    context={"url_prefix": self._database_url[:30]},
-                ) from exc
+        """Open the database connection (idempotent if already open)."""
+        with self._lock:
+            if self._conn is None:
+                conn: sqlite3.Connection | None = None
+                try:
+                    conn = sqlite3.connect(
+                        self._database_path,
+                        check_same_thread=False,
+                    )
+                    conn.row_factory = _dict_factory
+                    # Performance and safety pragmas
+                    conn.execute("PRAGMA journal_mode = WAL")
+                    conn.execute("PRAGMA foreign_keys = ON")
+                    conn.execute("PRAGMA busy_timeout = 5000")
+                    conn.execute("PRAGMA synchronous = NORMAL")
+                    self._conn = conn
+                    logger.debug("Database connection established: %s", self._database_path)
+                except sqlite3.Error as exc:
+                    if conn is not None:
+                        conn.close()
+                    raise DatabaseError(
+                        f"Failed to open database: {exc}",
+                        context={"path": self._database_path},
+                    ) from exc
 
     def close(self) -> None:
-        """Close the connection pool (idempotent if already closed)."""
-        if self._pool is not None and not self._pool.closed:
-            self._pool.close()
-            logger.debug("Database connection pool closed.")
+        """Close the database connection (idempotent if already closed)."""
+        with self._lock:
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
+                logger.debug("Database connection closed.")
 
     # ------------------------------------------------------------------
     # Cursor context manager
     # ------------------------------------------------------------------
 
     @contextmanager
-    def cursor(self) -> Generator[psycopg.Cursor, None, None]:
-        """Yield a dict-row cursor, committing on success or rolling back on error.
+    def cursor(self) -> Generator[sqlite3.Cursor, None, None]:
+        """Yield a cursor, committing on success or rolling back on error.
 
         Rolls back the current transaction and logs a warning if an exception
         is raised inside the ``with`` block, then re-raises the exception.
 
         Yields
         ------
-        psycopg.Cursor
+        sqlite3.Cursor
             A cursor whose rows are returned as dicts.
         """
         self.connect()
-        if self._pool is None:
-            raise ValueError("Database connection pool was not initialized after connect().")
-        with self._pool.connection() as conn:
-            with conn.cursor() as cur:
-                try:
-                    yield cur
-                    conn.commit()
-                except Exception:
-                    logger.warning(
-                        "Exception inside cursor block — rolling back transaction.",
-                        exc_info=True,
-                    )
-                    conn.rollback()
-                    raise
+        if self._conn is None:
+            raise RuntimeError("unreachable: connect() succeeded but _conn is None")
+        with self._lock:
+            cur = self._conn.cursor()
+            try:
+                yield cur
+                self._conn.commit()
+            except sqlite3.Error as exc:
+                logger.warning(
+                    "Database error inside cursor block — rolling back transaction.",
+                    exc_info=True,
+                )
+                self._conn.rollback()
+                raise DatabaseError(f"Database operation failed: {exc}") from exc
+            except Exception:
+                logger.warning(
+                    "Exception inside cursor block — rolling back transaction.",
+                    exc_info=True,
+                )
+                self._conn.rollback()
+                raise
+            finally:
+                cur.close()
 
     # ------------------------------------------------------------------
     # Maintenance
     # ------------------------------------------------------------------
 
-    def vacuum(self, *tables: str) -> None:
-        """Run VACUUM on the given tables to reclaim dead-tuple space.
+    def vacuum(self) -> None:
+        """Run VACUUM to reclaim unused space.
 
-        VACUUM cannot run inside a transaction, so this acquires a separate
-        autocommit connection from the pool.
-
-        Parameters
-        ----------
-        tables:
-            One or more table names to vacuum.
+        VACUUM cannot run inside a transaction, so this commits any pending
+        work and temporarily switches to autocommit mode.
         """
         self.connect()
-        if self._pool is None:
-            raise ValueError("Database connection pool was not initialized after connect().")
-        with self._pool.connection() as conn:
-            conn.autocommit = True
-            for table in tables:
-                logger.debug("VACUUM %s", table)
-                conn.execute(sql.SQL("VACUUM {}").format(sql.Identifier(table)))
+        if self._conn is None:
+            raise RuntimeError("unreachable: connect() succeeded but _conn is None")
+        with self._lock:
+            logger.debug("VACUUM")
+            self._conn.commit()
+            old_isolation = self._conn.isolation_level
+            self._conn.isolation_level = None
+            try:
+                self._conn.execute("VACUUM")
+            except sqlite3.Error as exc:
+                raise DatabaseError(f"Database operation failed: {exc}") from exc
+            finally:
+                self._conn.isolation_level = old_isolation
 
     # ------------------------------------------------------------------
     # Health check
@@ -161,7 +179,7 @@ class Database:
                 cur.execute("SELECT 1")
             return True
         except Exception as exc:  # noqa: BLE001
-            logger.error("Database health check failed: %s", exc)
+            logger.warning("Database health check failed: %s", exc)
             return False
 
     # ------------------------------------------------------------------
@@ -169,7 +187,7 @@ class Database:
     # ------------------------------------------------------------------
 
     def __enter__(self) -> Self:
-        """Open connection pool and return self."""
+        """Open connection and return self."""
         self.connect()
         return self
 
@@ -179,7 +197,7 @@ class Database:
         exc_val: BaseException | None,
         exc_tb: object,
     ) -> None:
-        """Close connection pool on exit (exceptions propagate normally)."""
+        """Close connection on exit (exceptions propagate normally)."""
         self.close()
 
     # ------------------------------------------------------------------
@@ -187,7 +205,5 @@ class Database:
     # ------------------------------------------------------------------
 
     def __repr__(self) -> str:
-        # Truncate URL to avoid leaking credentials in logs/tracebacks.
-        url_preview = self._database_url[:40] + ("…" if len(self._database_url) > 40 else "")
-        connected = self._pool is not None and not self._pool.closed
-        return f"Database(url={url_preview!r}, connected={connected})"
+        connected = self._conn is not None
+        return f"Database(path={self._database_path!r}, connected={connected})"

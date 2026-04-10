@@ -2,11 +2,10 @@
 
 from unittest.mock import MagicMock, call, patch
 
-import pytest
 import requests
+import pytest
 
-from snowfinder_common.exceptions import FetchError
-from snowfinder_common.http import download_file
+from snowfinder_common.http import _validate_retry_config, download_file
 
 
 def _make_mock_response(status_code: int = 200, chunks: list[bytes] | None = None):
@@ -18,6 +17,8 @@ def _make_mock_response(status_code: int = 200, chunks: list[bytes] | None = Non
         resp.raise_for_status.side_effect = requests.HTTPError(f"HTTP {status_code}", response=resp)
     else:
         resp.raise_for_status.return_value = None
+    resp.__enter__ = MagicMock(return_value=resp)
+    resp.__exit__ = MagicMock(return_value=False)
     return resp
 
 
@@ -168,47 +169,85 @@ class TestDownloadFileRetries:
 
         mock_sleep.assert_not_called()
 
-    def test_retries_on_generic_exception(self, tmp_path):
-        # requests.ConnectionError and Timeout are OSError subclasses (requests
-        # inherits from IOError), so they hit the FetchError branch.  Use a plain
-        # non-OSError exception to exercise the generic `except Exception` retry path.
+    def test_does_not_catch_non_retry_exception(self, tmp_path):
         dest = tmp_path / "conn_err.bin"
 
-        with (
-            patch(
-                "snowfinder_common.http.requests.get",
-                side_effect=ValueError("unexpected decode error"),
-            ) as mock_get,
-            patch("snowfinder_common.http.time.sleep"),
-        ):
-            result = download_file("http://example.com/conn_err.bin", str(dest), max_retries=2)
+        with patch(
+            "snowfinder_common.http.requests.get",
+            side_effect=ValueError("unexpected decode error"),
+        ) as mock_get:
+            with pytest.raises(ValueError, match="unexpected decode error"):
+                download_file("http://example.com/conn_err.bin", str(dest), max_retries=2)
 
-        assert result is False
-        assert mock_get.call_count == 2
+        assert mock_get.call_count == 1
 
 
 class TestDownloadFileOsError:
-    def test_oserror_raises_fetch_error(self, tmp_path):
+    def test_oserror_returns_false(self, tmp_path):
         # Use a directory as dest_path to provoke IsADirectoryError (an OSError subclass)
         dest = str(tmp_path)  # writing to a directory path raises IsADirectoryError
         ok_resp = _make_mock_response(200, [b"data"])
 
-        with patch("snowfinder_common.http.requests.get", return_value=ok_resp):
-            with pytest.raises(FetchError) as exc_info:
-                download_file("http://example.com/file.bin", dest)
+        with (
+            patch("snowfinder_common.http.requests.get", return_value=ok_resp),
+            patch("snowfinder_common.http.time.sleep") as mock_sleep,
+        ):
+            result = download_file("http://example.com/file.bin", dest)
 
-        assert "dest_path" in exc_info.value.context
-        assert exc_info.value.context["url"] == "http://example.com/file.bin"
+        assert result is False
+        mock_sleep.assert_has_calls([call(2.0), call(4.0)])
 
-    def test_fetch_error_context_contains_url_and_dest(self, tmp_path):
+    def test_oserror_is_retried_and_does_not_leave_destination_file(self, tmp_path):
         url = "http://example.com/target.bin"
         dest = str(tmp_path)
         ok_resp = _make_mock_response(200, [b"x"])
 
-        with patch("snowfinder_common.http.requests.get", return_value=ok_resp):
-            with pytest.raises(FetchError) as exc_info:
-                download_file(url, dest)
+        with patch("snowfinder_common.http.requests.get", return_value=ok_resp) as mock_get:
+            result = download_file(url, dest, max_retries=2)
 
-        ctx = exc_info.value.context
-        assert ctx["url"] == url
-        assert ctx["dest_path"] == dest
+        assert result is False
+        assert mock_get.call_count == 2
+        assert tmp_path.is_dir()
+
+
+class TestValidateRetryConfig:
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            (
+                {"max_retries": -1, "retry_delay_s": 1.0, "timeout_s": 1.0},
+                "max_retries must be non-negative",
+            ),
+            (
+                {"max_retries": 1, "retry_delay_s": 0.0, "timeout_s": 1.0},
+                "retry_delay_s must be positive",
+            ),
+            (
+                {"max_retries": 1, "retry_delay_s": -0.5, "timeout_s": 1.0},
+                "retry_delay_s must be positive",
+            ),
+            (
+                {"max_retries": 1, "retry_delay_s": 1.0, "timeout_s": 0.0},
+                "timeout_s must be positive",
+            ),
+            (
+                {"max_retries": 1, "retry_delay_s": 1.0, "timeout_s": -2.0},
+                "timeout_s must be positive",
+            ),
+        ],
+    )
+    def test_rejects_invalid_numeric_values(self, kwargs, message):
+        with pytest.raises(ValueError, match=message):
+            _validate_retry_config(**kwargs)
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"max_retries": "3", "retry_delay_s": 1.0, "timeout_s": 1.0},
+            {"max_retries": 3, "retry_delay_s": "1.0", "timeout_s": 1.0},
+            {"max_retries": 3, "retry_delay_s": 1.0, "timeout_s": "1.0"},
+        ],
+    )
+    def test_rejects_non_numeric_values(self, kwargs):
+        with pytest.raises(TypeError):
+            _validate_retry_config(**kwargs)

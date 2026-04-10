@@ -75,6 +75,8 @@ def configure_logging(
     root = logging.getLogger()
     root.setLevel(level)
     # Replace existing handlers so repeated calls don't duplicate output.
+    for existing_handler in root.handlers[:]:
+        existing_handler.close()
     root.handlers.clear()
     root.addHandler(handler)
 

@@ -6,6 +6,19 @@ wet-bulb adjustments. Snow-to-liquid ratio (SLR) is temperature-dependent.
 """
 
 import math
+import logging
+
+
+logger = logging.getLogger(__name__)
+
+
+def _validate_numeric(value: int | float, name: str) -> None:
+    if isinstance(value, bool):
+        raise TypeError(f"{name} must be numeric, got {type(value).__name__}")
+    if not isinstance(value, (int, float)):
+        raise TypeError(f"{name} must be numeric, got {type(value).__name__}")
+    if math.isnan(value) or math.isinf(value):
+        raise ValueError(f"{name} must be finite, got {value}")
 
 
 def _approx_wet_bulb(temp_c: float, rh_pct: float) -> float:
@@ -13,6 +26,8 @@ def _approx_wet_bulb(temp_c: float, rh_pct: float) -> float:
 
     Valid for RH 5-99% and temp -20 to 50°C.
     """
+    _validate_numeric(temp_c, "temp_c")
+    _validate_numeric(rh_pct, "rh_pct")
     t = temp_c
     rh = max(5.0, min(99.0, rh_pct))
 
@@ -42,6 +57,10 @@ def compute_snow_fraction(
     - If surface wet-bulb < 0°C, boost snow fraction
     - If surface wet-bulb > 3°C, reduce snow fraction
     """
+    _validate_numeric(temp_850_c, "temp_850_c")
+    _validate_numeric(temp_surface_c, "temp_surface_c")
+    _validate_numeric(rh_surface_pct, "rh_surface_pct")
+
     # Primary: 850hPa temperature linear ramp
     if temp_850_c <= -2.0:
         frac = 1.0
@@ -74,6 +93,7 @@ def compute_slr(temp_850_c: float) -> float:
     - Near freezing (0°C): ~8:1 (wet/heavy)
     - Warm (> 0°C): ~6:1
     """
+    _validate_numeric(temp_850_c, "temp_850_c")
     if temp_850_c <= -15.0:
         return 1.5  # 15:1 ratio (cm per mm)
     elif temp_850_c <= -10.0:
@@ -104,6 +124,15 @@ def compute_snowfall(
 
     Returns: (snowfall_cm, rain_mm, snow_fraction)
     """
+    _validate_numeric(precip_mm, "precip_mm")
+    _validate_numeric(temp_850_c, "temp_850_c")
+    _validate_numeric(temp_surface_c, "temp_surface_c")
+    _validate_numeric(rh_surface_pct, "rh_surface_pct")
+
+    if precip_mm < 0.0:
+        logger.warning("Negative precipitation value %f clamped to 0", precip_mm)
+        precip_mm = 0.0
+
     if precip_mm <= 0.0:
         return 0.0, 0.0, 0.0
 

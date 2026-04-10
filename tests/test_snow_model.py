@@ -47,6 +47,11 @@ class TestApproxWetBulb:
         tw = _approx_wet_bulb(40.0, 10.0)
         assert tw < 25.0
 
+    @pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+    def test_rejects_non_finite_inputs(self, value):
+        with pytest.raises(ValueError, match="must be finite"):
+            _approx_wet_bulb(value, 50.0)
+
 
 class TestComputeSnowFraction:
     def test_cold_850hpa_returns_full_snow(self):
@@ -105,6 +110,11 @@ class TestComputeSnowFraction:
         frac = compute_snow_fraction(temp_850, 0.0, 70.0)
         assert expected_min <= frac <= expected_max
 
+    @pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+    def test_rejects_non_finite_inputs(self, value):
+        with pytest.raises(ValueError, match="must be finite"):
+            compute_snow_fraction(value, 0.0, 70.0)
+
 
 class TestComputeSlr:
     def test_very_cold_returns_max_slr(self):
@@ -152,6 +162,11 @@ class TestComputeSlr:
         for temp in [-30.0, -15.0, -5.0, 0.0, 5.0, 15.0]:
             assert compute_slr(temp) > 0.0
 
+    @pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+    def test_rejects_non_finite_inputs(self, value):
+        with pytest.raises(ValueError, match="must be finite"):
+            compute_slr(value)
+
 
 class TestComputeSnowfall:
     def test_zero_precip_returns_all_zeros(self):
@@ -165,6 +180,12 @@ class TestComputeSnowfall:
         assert snowfall_cm == 0.0
         assert rain_mm == 0.0
         assert snow_frac == 0.0
+
+    def test_negative_precip_logs_warning(self, caplog):
+        with caplog.at_level("WARNING"):
+            compute_snowfall(-1.0, -5.0, -2.0, 80.0)
+
+        assert any("Negative precipitation value" in record.message for record in caplog.records)
 
     def test_cold_conditions_produce_mostly_snow(self):
         snowfall_cm, rain_mm, snow_frac = compute_snowfall(10.0, -10.0, -5.0, 80.0)
@@ -219,7 +240,11 @@ class TestComputeSnowfall:
         assert 0.0 <= snow_frac <= 1.0
 
     def test_larger_precip_gives_larger_snowfall(self):
-        _, _, frac = compute_snowfall(1.0, -10.0, -5.0, 80.0)
         snow1, _, _ = compute_snowfall(5.0, -10.0, -5.0, 80.0)
         snow2, _, _ = compute_snowfall(10.0, -10.0, -5.0, 80.0)
         assert snow2 > snow1 > 0.0
+
+    @pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+    def test_rejects_non_finite_precipitation(self, value):
+        with pytest.raises(ValueError, match="must be finite"):
+            compute_snowfall(value, -5.0, -2.0, 80.0)

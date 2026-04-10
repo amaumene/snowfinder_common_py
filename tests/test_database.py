@@ -1,276 +1,368 @@
-"""Tests for snowfinder_common.database."""
+"""Tests for snowfinder_common.database (SQLite implementation)."""
 
-from unittest.mock import MagicMock, patch
+import sqlite3
+import threading
+import time
+from unittest.mock import patch
 
-import psycopg
 import pytest
 
 from snowfinder_common.database import Database
 from snowfinder_common.exceptions import DatabaseError
 
 
-def _make_mock_pool(closed: bool = False):
-    """Return a mock ConnectionPool."""
-    pool = MagicMock()
-    pool.closed = closed
-    conn = MagicMock()
-    cursor = MagicMock()
-    cursor.__enter__ = MagicMock(return_value=cursor)
-    cursor.__exit__ = MagicMock(return_value=False)
-    conn.cursor.return_value = cursor
-    conn.__enter__ = MagicMock(return_value=conn)
-    conn.__exit__ = MagicMock(return_value=False)
-    pool.connection.return_value = conn
-    return pool
-
-
 class TestDatabaseInit:
-    def test_raises_database_error_for_empty_url(self):
-        with pytest.raises(DatabaseError, match="database_url is required"):
+    def test_raises_database_error_for_empty_path(self):
+        with pytest.raises(DatabaseError, match="database_path is required"):
             Database("")
 
-    def test_stores_database_url(self):
-        db = Database("postgresql://user:pass@host/db")
-        assert db._database_url == "postgresql://user:pass@host/db"
+    def test_stores_database_path(self, tmp_path):
+        db_path = str(tmp_path / "test.db")
+        db = Database(db_path)
+        assert db._database_path == db_path
 
-    def test_pool_is_none_before_connect(self):
-        db = Database("postgresql://localhost/test")
-        assert db._pool is None
-
-    def test_default_pool_sizes(self):
-        db = Database("postgresql://localhost/test")
-        assert db._min_size == 1
-        assert db._max_size == 5
-
-    def test_custom_pool_sizes(self):
-        db = Database("postgresql://localhost/test", min_size=2, max_size=10)
-        assert db._min_size == 2
-        assert db._max_size == 10
+    def test_conn_is_none_before_connect(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        assert db._conn is None
 
 
 class TestDatabaseConnect:
-    def test_connect_creates_pool(self):
-        db = Database("postgresql://localhost/test")
-        mock_pool = _make_mock_pool()
+    def test_connect_creates_connection(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        db.connect()
+        try:
+            assert db._conn is not None
+        finally:
+            db.close()
 
-        with patch("snowfinder_common.database.ConnectionPool", return_value=mock_pool):
+    def test_connect_sets_wal_journal_mode(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        db.connect()
+        try:
+            row = db._conn.execute("PRAGMA journal_mode").fetchone()
+            assert row["journal_mode"] == "wal"
+        finally:
+            db.close()
+
+    def test_connect_sets_foreign_keys_on(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        db.connect()
+        try:
+            row = db._conn.execute("PRAGMA foreign_keys").fetchone()
+            assert row["foreign_keys"] == 1
+        finally:
+            db.close()
+
+    def test_connect_sets_busy_timeout(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        db.connect()
+        try:
+            row = db._conn.execute("PRAGMA busy_timeout").fetchone()
+            assert row["timeout"] == 5000
+        finally:
+            db.close()
+
+    def test_connect_sets_synchronous_normal(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        db.connect()
+        try:
+            row = db._conn.execute("PRAGMA synchronous").fetchone()
+            # NORMAL = 1
+            assert row["synchronous"] == 1
+        finally:
+            db.close()
+
+    def test_connect_idempotent_when_already_connected(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        db.connect()
+        try:
+            first_conn = db._conn
+            db.connect()  # second call should not replace the connection
+            assert db._conn is first_conn
+        finally:
+            db.close()
+
+    def test_connect_raises_database_error_on_invalid_path(self):
+        # A path in a non-existent directory should raise DatabaseError
+        db = Database("/nonexistent_dir_xyz/test.db")
+        with pytest.raises(DatabaseError, match="Failed to open database"):
             db.connect()
-
-        assert db._pool is mock_pool
-
-    def test_connect_passes_correct_args(self):
-        db = Database("postgresql://localhost/test", min_size=2, max_size=8)
-        mock_pool = _make_mock_pool()
-
-        with patch("snowfinder_common.database.ConnectionPool", return_value=mock_pool) as cls:
-            db.connect()
-
-        _, kwargs = cls.call_args
-        assert kwargs["conninfo"] == "postgresql://localhost/test"
-        assert kwargs["min_size"] == 2
-        assert kwargs["max_size"] == 8
-        assert "row_factory" in kwargs["kwargs"]
-
-    def test_connect_idempotent_when_pool_open(self):
-        db = Database("postgresql://localhost/test")
-        mock_pool = _make_mock_pool(closed=False)
-
-        with patch("snowfinder_common.database.ConnectionPool", return_value=mock_pool) as cls:
-            db.connect()
-            db.connect()  # second call should not create a new pool
-
-        assert cls.call_count == 1
-
-    def test_connect_raises_database_error_on_psycopg_error(self):
-        db = Database("postgresql://localhost/test")
-
-        with patch(
-            "snowfinder_common.database.ConnectionPool",
-            side_effect=psycopg.Error("connection refused"),
-        ):
-            with pytest.raises(DatabaseError, match="Failed to connect"):
-                db.connect()
-
-    def test_connect_reopens_closed_pool(self):
-        db = Database("postgresql://localhost/test")
-        closed_pool = _make_mock_pool(closed=True)
-        new_pool = _make_mock_pool(closed=False)
-        db._pool = closed_pool
-
-        with patch("snowfinder_common.database.ConnectionPool", return_value=new_pool) as cls:
-            db.connect()
-
-        assert cls.call_count == 1
-        assert db._pool is new_pool
 
 
 class TestDatabaseClose:
-    def test_close_closes_pool(self):
-        db = Database("postgresql://localhost/test")
-        mock_pool = _make_mock_pool(closed=False)
-        db._pool = mock_pool
-
+    def test_close_sets_conn_to_none(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        db.connect()
+        assert db._conn is not None
         db.close()
+        assert db._conn is None
 
-        mock_pool.close.assert_called_once()
+    def test_close_idempotent_when_already_closed(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        db.connect()
+        db.close()
+        db.close()  # should not raise
+        assert db._conn is None
 
-    def test_close_idempotent_when_already_closed(self):
-        db = Database("postgresql://localhost/test")
-        mock_pool = _make_mock_pool(closed=True)
-        db._pool = mock_pool
-
-        db.close()  # should not call pool.close() on an already-closed pool
-
-        mock_pool.close.assert_not_called()
-
-    def test_close_safe_when_pool_is_none(self):
-        db = Database("postgresql://localhost/test")
+    def test_close_safe_when_never_connected(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
         db.close()  # should not raise
 
 
-class TestDatabaseContextManager:
-    def test_enter_returns_self(self):
-        db = Database("postgresql://localhost/test")
-        mock_pool = _make_mock_pool()
-
-        with patch("snowfinder_common.database.ConnectionPool", return_value=mock_pool):
-            result = db.__enter__()
-
-        assert result is db
-
-    def test_context_manager_opens_and_closes(self):
-        mock_pool = _make_mock_pool()
-
-        with patch("snowfinder_common.database.ConnectionPool", return_value=mock_pool):
-            with Database("postgresql://localhost/test"):
-                assert mock_pool.closed is False
-
-        mock_pool.close.assert_called_once()
-
-    def test_context_manager_closes_on_exception(self):
-        mock_pool = _make_mock_pool()
-
-        with patch("snowfinder_common.database.ConnectionPool", return_value=mock_pool):
-            with pytest.raises(ValueError):
-                with Database("postgresql://localhost/test"):
-                    raise ValueError("oops")
-
-        mock_pool.close.assert_called_once()
-
-    def test_exception_propagates_from_context_manager(self):
-        mock_pool = _make_mock_pool()
-
-        with patch("snowfinder_common.database.ConnectionPool", return_value=mock_pool):
-            with pytest.raises(RuntimeError, match="test error"):
-                with Database("postgresql://localhost/test"):
-                    raise RuntimeError("test error")
-
-
 class TestDatabaseCursor:
-    def _setup_db_with_pool(self):
-        db = Database("postgresql://localhost/test")
-        mock_pool = _make_mock_pool()
-        db._pool = mock_pool
-        return db, mock_pool
-
-    def test_cursor_yields_cursor_object(self):
-        db, mock_pool = self._setup_db_with_pool()
-
-        with patch("snowfinder_common.database.ConnectionPool", return_value=mock_pool):
+    def test_cursor_yields_cursor_object(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        db.connect()
+        try:
             with db.cursor() as cur:
-                assert cur is not None
+                assert isinstance(cur, sqlite3.Cursor)
+        finally:
+            db.close()
 
-    def test_cursor_commits_on_success(self):
-        db, mock_pool = self._setup_db_with_pool()
-        conn = mock_pool.connection.return_value.__enter__.return_value
+    def test_cursor_commits_on_success(self, tmp_path):
+        db_path = str(tmp_path / "test.db")
+        db = Database(db_path)
+        db.connect()
+        try:
+            with db.cursor() as cur:
+                cur.execute("CREATE TABLE t (x INTEGER)")
+                cur.execute("INSERT INTO t VALUES (42)")
+        finally:
+            db.close()
 
-        with patch("snowfinder_common.database.ConnectionPool", return_value=mock_pool):
-            with db.cursor():
-                pass
+        # Reopen and verify data was committed
+        conn = sqlite3.connect(db_path)
+        row = conn.execute("SELECT x FROM t").fetchone()
+        conn.close()
+        assert row[0] == 42
 
-        conn.commit.assert_called_once()
+    def test_cursor_rolls_back_on_exception(self, tmp_path):
+        db_path = str(tmp_path / "test.db")
+        db = Database(db_path)
+        db.connect()
+        try:
+            with db.cursor() as cur:
+                cur.execute("CREATE TABLE t (x INTEGER)")
+        finally:
+            db.close()
 
-    def test_cursor_rolls_back_on_exception(self):
-        db, mock_pool = self._setup_db_with_pool()
-        conn = mock_pool.connection.return_value.__enter__.return_value
-
-        with patch("snowfinder_common.database.ConnectionPool", return_value=mock_pool):
+        db2 = Database(db_path)
+        db2.connect()
+        try:
             with pytest.raises(ValueError):
-                with db.cursor():
-                    raise ValueError("query failed")
+                with db2.cursor() as cur:
+                    cur.execute("INSERT INTO t VALUES (99)")
+                    raise ValueError("rollback me")
+        finally:
+            db2.close()
 
-        conn.rollback.assert_called_once()
-        conn.commit.assert_not_called()
+        # Verify the insert was rolled back
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute("SELECT x FROM t").fetchall()
+        conn.close()
+        assert rows == []
 
-    def test_cursor_re_raises_exception(self):
-        db, mock_pool = self._setup_db_with_pool()
-
-        with patch("snowfinder_common.database.ConnectionPool", return_value=mock_pool):
+    def test_cursor_re_raises_exception(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        db.connect()
+        try:
             with pytest.raises(RuntimeError, match="boom"):
                 with db.cursor():
                     raise RuntimeError("boom")
+        finally:
+            db.close()
 
-    def test_cursor_calls_connect_if_not_connected(self):
-        db = Database("postgresql://localhost/test")
-        mock_pool = _make_mock_pool()
+    def test_cursor_calls_connect_if_not_connected(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        # Do NOT call connect() manually
+        try:
+            with db.cursor() as cur:
+                cur.execute("SELECT 1")
+            assert db._conn is not None
+        finally:
+            db.close()
 
-        with patch("snowfinder_common.database.ConnectionPool", return_value=mock_pool):
-            with db.cursor():
-                pass
 
-        assert db._pool is mock_pool
+class TestDatabaseVacuum:
+    def test_vacuum_runs_without_error(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        db.connect()
+        try:
+            db.vacuum()  # should not raise
+        finally:
+            db.close()
+
+    def test_vacuum_calls_connect_if_not_connected(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        db.vacuum()
+        assert db._conn is not None
+        db.close()
 
 
 class TestDatabaseHealthCheck:
-    def test_returns_true_when_query_succeeds(self):
-        db = Database("postgresql://localhost/test")
-        mock_pool = _make_mock_pool()
+    def test_health_check_returns_true_when_query_succeeds(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
 
-        with patch("snowfinder_common.database.ConnectionPool", return_value=mock_pool):
-            result = db.health_check()
+        try:
+            assert db.health_check() is True
+        finally:
+            db.close()
 
-        assert result is True
+    def test_health_check_returns_false_when_cursor_fails(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
 
-    def test_returns_false_when_query_raises(self):
-        db = Database("postgresql://localhost/test")
+        with patch.object(db, "cursor", side_effect=DatabaseError("boom")):
+            assert db.health_check() is False
 
-        with patch.object(db, "cursor", side_effect=Exception("db down")):
-            result = db.health_check()
 
-        assert result is False
+class TestDatabaseContextManager:
+    def test_enter_returns_self(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        result = db.__enter__()
+        try:
+            assert result is db
+        finally:
+            db.close()
 
-    def test_does_not_raise_on_failure(self):
-        db = Database("postgresql://localhost/test")
+    def test_context_manager_opens_and_closes(self, tmp_path):
+        db_path = str(tmp_path / "test.db")
+        with Database(db_path) as db:
+            assert db._conn is not None
+        assert db._conn is None
 
-        with patch.object(db, "cursor", side_effect=psycopg.Error("timeout")):
-            result = db.health_check()  # should not raise
+    def test_context_manager_closes_on_exception(self, tmp_path):
+        db_path = str(tmp_path / "test.db")
+        db_ref = None
+        with pytest.raises(ValueError):
+            with Database(db_path) as db:
+                db_ref = db
+                raise ValueError("oops")
+        assert db_ref._conn is None
 
-        assert result is False
+    def test_exception_propagates_from_context_manager(self, tmp_path):
+        with pytest.raises(RuntimeError, match="test error"):
+            with Database(str(tmp_path / "test.db")):
+                raise RuntimeError("test error")
+
+
+class TestDatabaseIsConnected:
+    def test_is_connected_false_before_connect(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        assert db._conn is None
+
+    def test_is_connected_true_after_connect(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        db.connect()
+        try:
+            assert db._conn is not None
+        finally:
+            db.close()
+
+    def test_is_connected_false_after_close(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        db.connect()
+        db.close()
+        assert db._conn is None
 
 
 class TestDatabaseRepr:
-    def test_repr_shows_connected_false_before_connect(self):
-        db = Database("postgresql://localhost/test")
+    def test_repr_shows_connected_false_before_connect(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
         r = repr(db)
         assert "connected=False" in r
 
-    def test_repr_shows_connected_true_after_connect(self):
-        db = Database("postgresql://localhost/test")
-        mock_pool = _make_mock_pool(closed=False)
+    def test_repr_shows_connected_true_after_connect(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        db.connect()
+        try:
+            assert "connected=True" in repr(db)
+        finally:
+            db.close()
 
-        with patch("snowfinder_common.database.ConnectionPool", return_value=mock_pool):
+    def test_repr_contains_path(self, tmp_path):
+        db_path = str(tmp_path / "mydb.db")
+        db = Database(db_path)
+        r = repr(db)
+        assert db_path in r
+
+    def test_repr_shows_connected_false_after_close(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        db.connect()
+        db.close()
+        assert "connected=False" in repr(db)
+
+
+class TestDatabaseErrorWrapping:
+    def test_connect_wraps_sqlite_error(self):
+        # Path in non-existent directory triggers OperationalError
+        db = Database("/no_such_dir_abc123/test.db")
+        with pytest.raises(DatabaseError) as exc_info:
             db.connect()
+        assert exc_info.value.__cause__ is not None
+        assert isinstance(exc_info.value.__cause__, sqlite3.Error)
 
-        assert "connected=True" in repr(db)
+    def test_database_error_has_context(self):
+        db = Database("/no_such_dir_abc123/test.db")
+        with pytest.raises(DatabaseError) as exc_info:
+            db.connect()
+        assert "path" in exc_info.value.context
 
-    def test_repr_truncates_long_url(self):
-        long_url = "postgresql://user:verylongpassword@very-long-hostname.example.com:5432/mydb"
-        db = Database(long_url)
-        r = repr(db)
-        assert "…" in r
+    def test_cursor_wraps_sqlite_error_as_database_error(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
 
-    def test_repr_no_truncation_for_short_url(self):
-        short_url = "postgresql://localhost/db"
-        db = Database(short_url)
-        r = repr(db)
-        assert "…" not in r
+        with pytest.raises(DatabaseError) as exc_info:
+            with db.cursor() as cur:
+                cur.execute("SELECT * FROM missing_table")
+
+        assert isinstance(exc_info.value.__cause__, sqlite3.Error)
+
+
+class TestDatabaseThreadSafety:
+    def test_cursor_uses_lock_for_thread_safe_access(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        db.connect()
+        events = []
+        entered_first = threading.Event()
+        release_first = threading.Event()
+
+        def worker(name):
+            with db.cursor() as cur:
+                cur.execute("SELECT 1")
+                events.append(f"enter-{name}")
+                if name == "first":
+                    entered_first.set()
+                    release_first.wait(timeout=2)
+                else:
+                    events.append("second-acquired")
+
+        try:
+            first = threading.Thread(target=worker, args=("first",))
+            second = threading.Thread(target=worker, args=("second",))
+
+            first.start()
+            assert entered_first.wait(timeout=2)
+
+            second.start()
+            time.sleep(0.1)
+            assert "second-acquired" not in events
+
+            release_first.set()
+            first.join(timeout=2)
+            second.join(timeout=2)
+
+            assert events[0] == "enter-first"
+            assert events[-2:] == ["enter-second", "second-acquired"]
+        finally:
+            db.close()
+
+
+class TestDatabaseDoubleConnect:
+    def test_second_connect_is_noop(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        db.connect()
+        first_conn = db._conn
+        db.connect()  # should not replace the existing connection
+        try:
+            assert db._conn is first_conn
+        finally:
+            db.close()

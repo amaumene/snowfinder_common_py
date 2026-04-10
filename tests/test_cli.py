@@ -1,12 +1,11 @@
 """Tests for snowfinder_common.cli."""
 
-import sys
+import argparse
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from snowfinder_common.cli import run_service
-from snowfinder_common.database import Database
 
 
 def _make_mock_db_class(raises: Exception | None = None):
@@ -21,8 +20,60 @@ def _make_mock_db_class(raises: Exception | None = None):
 
 
 class TestRunServiceSuccess:
+    def test_setup_parser_registers_extra_arguments(self, monkeypatch):
+        monkeypatch.setenv("DATABASE_PATH", "/tmp/test.db")
+        pipeline_fn = MagicMock()
+        mock_db_class, _ = _make_mock_db_class()
+
+        def setup_parser(parser):
+            parser.add_argument("--extract-msm", action="store_true")
+
+        with (
+            patch("snowfinder_common.cli.load_dotenv"),
+            patch("sys.argv", ["prog", "--extract-msm"]),
+            patch("snowfinder_common.cli.configure_logging"),
+        ):
+            run_service(
+                "myservice",
+                pipeline_fn,
+                db_class=mock_db_class,
+                setup_parser=setup_parser,
+            )
+
+        args = pipeline_fn.call_args.args[1]
+        assert args.extract_msm is True
+
+    def test_setup_parser_receives_argument_parser_with_expected_arguments(self, monkeypatch):
+        monkeypatch.setenv("DATABASE_PATH", "/tmp/test.db")
+        pipeline_fn = MagicMock()
+        mock_db_class, _ = _make_mock_db_class()
+        seen = {}
+
+        def setup_parser(parser):
+            seen["parser"] = parser
+
+        with (
+            patch("snowfinder_common.cli.load_dotenv"),
+            patch("sys.argv", ["prog"]),
+            patch("snowfinder_common.cli.configure_logging"),
+        ):
+            run_service(
+                "myservice",
+                pipeline_fn,
+                db_class=mock_db_class,
+                setup_parser=setup_parser,
+            )
+
+        parser = seen["parser"]
+        assert isinstance(parser, argparse.ArgumentParser)
+        action_by_dest = {action.dest: action for action in parser._actions}
+        assert "verbose" in action_by_dest
+        assert "database_path" in action_by_dest
+        assert action_by_dest["verbose"].option_strings == ["--verbose", "-v"]
+        assert action_by_dest["database_path"].option_strings == ["--database-path"]
+
     def test_calls_pipeline_fn_with_db(self, monkeypatch):
-        monkeypatch.setenv("DATABASE_URL", "postgresql://localhost/test")
+        monkeypatch.setenv("DATABASE_PATH", "/tmp/test.db")
         pipeline_fn = MagicMock()
         mock_db_class, mock_db_instance = _make_mock_db_class()
         args_instance = None
@@ -37,8 +88,8 @@ class TestRunServiceSuccess:
 
         pipeline_fn.assert_called_once_with(mock_db_instance, args_instance)
 
-    def test_instantiates_db_with_database_url(self, monkeypatch):
-        monkeypatch.setenv("DATABASE_URL", "postgresql://localhost/mydb")
+    def test_instantiates_db_with_database_path(self, monkeypatch):
+        monkeypatch.setenv("DATABASE_PATH", "/tmp/mydb.db")
         pipeline_fn = MagicMock()
         mock_db_class, _ = _make_mock_db_class()
 
@@ -49,10 +100,10 @@ class TestRunServiceSuccess:
         ):
             run_service("myservice", pipeline_fn, db_class=mock_db_class)
 
-        mock_db_class.assert_called_once_with("postgresql://localhost/mydb")
+        mock_db_class.assert_called_once_with("/tmp/mydb.db")
 
     def test_verbose_flag_passed_to_configure_logging(self, monkeypatch):
-        monkeypatch.setenv("DATABASE_URL", "postgresql://localhost/test")
+        monkeypatch.setenv("DATABASE_PATH", "/tmp/test.db")
         pipeline_fn = MagicMock()
         mock_db_class, _ = _make_mock_db_class()
 
@@ -66,7 +117,7 @@ class TestRunServiceSuccess:
         mock_conf.assert_called_once_with(verbose=True)
 
     def test_verbose_defaults_to_false(self, monkeypatch):
-        monkeypatch.setenv("DATABASE_URL", "postgresql://localhost/test")
+        monkeypatch.setenv("DATABASE_PATH", "/tmp/test.db")
         pipeline_fn = MagicMock()
         mock_db_class, _ = _make_mock_db_class()
 
@@ -79,22 +130,22 @@ class TestRunServiceSuccess:
 
         mock_conf.assert_called_once_with(verbose=False)
 
-    def test_database_url_from_cli_flag(self, monkeypatch):
-        monkeypatch.delenv("DATABASE_URL", raising=False)
+    def test_database_path_from_cli_flag(self, monkeypatch):
+        monkeypatch.delenv("DATABASE_PATH", raising=False)
         pipeline_fn = MagicMock()
         mock_db_class, _ = _make_mock_db_class()
 
         with (
             patch("snowfinder_common.cli.load_dotenv"),
-            patch("sys.argv", ["prog", "--database-url", "postgresql://host/flagdb"]),
+            patch("sys.argv", ["prog", "--database-path", "/tmp/flagdb.db"]),
             patch("snowfinder_common.cli.configure_logging"),
         ):
             run_service("myservice", pipeline_fn, db_class=mock_db_class)
 
-        mock_db_class.assert_called_once_with("postgresql://host/flagdb")
+        mock_db_class.assert_called_once_with("/tmp/flagdb.db")
 
     def test_db_used_as_context_manager(self, monkeypatch):
-        monkeypatch.setenv("DATABASE_URL", "postgresql://localhost/test")
+        monkeypatch.setenv("DATABASE_PATH", "/tmp/test.db")
         pipeline_fn = MagicMock()
         mock_db_class, mock_db_instance = _make_mock_db_class()
 
@@ -118,9 +169,9 @@ class TestRunServiceSuccess:
         assert default is Database
 
 
-class TestRunServiceMissingDatabaseUrl:
-    def test_exits_with_code_1_when_no_database_url(self, monkeypatch):
-        monkeypatch.delenv("DATABASE_URL", raising=False)
+class TestRunServiceMissingDatabasePath:
+    def test_exits_with_code_1_when_no_database_path(self, monkeypatch):
+        monkeypatch.delenv("DATABASE_PATH", raising=False)
         pipeline_fn = MagicMock()
 
         with (
@@ -133,8 +184,8 @@ class TestRunServiceMissingDatabaseUrl:
 
         assert exc_info.value.code == 1
 
-    def test_pipeline_not_called_when_no_database_url(self, monkeypatch):
-        monkeypatch.delenv("DATABASE_URL", raising=False)
+    def test_pipeline_not_called_when_no_database_path(self, monkeypatch):
+        monkeypatch.delenv("DATABASE_PATH", raising=False)
         pipeline_fn = MagicMock()
 
         with (
@@ -150,7 +201,7 @@ class TestRunServiceMissingDatabaseUrl:
 
 class TestRunServicePipelineError:
     def test_exits_with_code_1_when_pipeline_raises(self, monkeypatch):
-        monkeypatch.setenv("DATABASE_URL", "postgresql://localhost/test")
+        monkeypatch.setenv("DATABASE_PATH", "/tmp/test.db")
         pipeline_fn = MagicMock(side_effect=RuntimeError("pipeline boom"))
         mock_db_class, _ = _make_mock_db_class()
 
@@ -165,7 +216,7 @@ class TestRunServicePipelineError:
         assert exc_info.value.code == 1
 
     def test_exits_when_db_context_manager_raises(self, monkeypatch):
-        monkeypatch.setenv("DATABASE_URL", "postgresql://localhost/test")
+        monkeypatch.setenv("DATABASE_PATH", "/tmp/test.db")
         pipeline_fn = MagicMock()
         mock_db_class, _ = _make_mock_db_class(raises=ConnectionError("db refused"))
 
@@ -180,7 +231,7 @@ class TestRunServicePipelineError:
         assert exc_info.value.code == 1
 
     def test_pipeline_called_once_before_error(self, monkeypatch):
-        monkeypatch.setenv("DATABASE_URL", "postgresql://localhost/test")
+        monkeypatch.setenv("DATABASE_PATH", "/tmp/test.db")
         pipeline_fn = MagicMock(side_effect=ValueError("bad data"))
         mock_db_class, _ = _make_mock_db_class()
 

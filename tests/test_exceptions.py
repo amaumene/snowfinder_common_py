@@ -27,6 +27,15 @@ class TestSnowfinderErrorBase:
         exc = SnowfinderError("oops", context=ctx)
         assert exc.context == ctx
 
+    def test_context_is_defensively_copied(self):
+        ctx = {"key": "value"}
+        exc = SnowfinderError("oops", context=ctx)
+
+        ctx["key"] = "changed"
+        ctx["extra"] = True
+
+        assert exc.context == {"key": "value"}
+
     def test_repr_without_context(self):
         exc = SnowfinderError("bad thing")
         assert repr(exc) == "SnowfinderError('bad thing')"

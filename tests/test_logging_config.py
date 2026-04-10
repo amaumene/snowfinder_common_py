@@ -1,10 +1,29 @@
 """Tests for snowfinder_common.logging_config."""
 
+import builtins
 import logging
 
 import pytest
 
 from snowfinder_common.logging_config import _level_from_env, configure_logging
+
+
+@pytest.fixture(autouse=True)
+def reset_root_logger():
+    root = logging.getLogger()
+    original_level = root.level
+    original_handlers = root.handlers[:]
+    root.handlers.clear()
+    try:
+        yield
+    finally:
+        current_handlers = root.handlers[:]
+        for handler in current_handlers:
+            if handler not in original_handlers:
+                handler.close()
+        root.handlers.clear()
+        root.setLevel(original_level)
+        root.handlers[:] = original_handlers
 
 
 class TestLevelFromEnv:
@@ -99,10 +118,38 @@ class TestConfigureLogging:
 
     def test_json_output_falls_back_gracefully_when_package_missing(self, monkeypatch):
         monkeypatch.delenv("LOG_LEVEL", raising=False)
-        # Even if json-logger is missing, should not raise
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "pythonjsonlogger":
+                raise ImportError("simulated missing dependency")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+
         configure_logging(json_output=True)
         root = logging.getLogger()
         assert len(root.handlers) == 1
+
+    def test_json_output_fallback_uses_plain_text_formatter(self, monkeypatch, caplog):
+        monkeypatch.delenv("LOG_LEVEL", raising=False)
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "pythonjsonlogger":
+                raise ImportError("simulated missing dependency")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+
+        with caplog.at_level(logging.WARNING):
+            configure_logging(json_output=True)
+
+        formatter = logging.getLogger().handlers[0].formatter
+        assert "JsonFormatter" not in type(formatter).__name__
+        assert any(
+            "falling back to plain-text logging" in record.message for record in caplog.records
+        )
 
     def test_warning_level_from_env(self, monkeypatch):
         monkeypatch.setenv("LOG_LEVEL", "WARNING")

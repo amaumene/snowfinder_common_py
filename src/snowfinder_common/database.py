@@ -25,6 +25,7 @@ from collections.abc import Generator
 from typing import Self
 
 import psycopg
+from psycopg import sql
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
@@ -120,6 +121,30 @@ class Database:
                     )
                     conn.rollback()
                     raise
+
+    # ------------------------------------------------------------------
+    # Maintenance
+    # ------------------------------------------------------------------
+
+    def vacuum(self, *tables: str) -> None:
+        """Run VACUUM on the given tables to reclaim dead-tuple space.
+
+        VACUUM cannot run inside a transaction, so this acquires a separate
+        autocommit connection from the pool.
+
+        Parameters
+        ----------
+        tables:
+            One or more table names to vacuum.
+        """
+        self.connect()
+        if self._pool is None:
+            raise ValueError("Database connection pool was not initialized after connect().")
+        with self._pool.connection() as conn:
+            conn.autocommit = True
+            for table in tables:
+                logger.debug("VACUUM %s", table)
+                conn.execute(sql.SQL("VACUUM {}").format(sql.Identifier(table)))
 
     # ------------------------------------------------------------------
     # Health check

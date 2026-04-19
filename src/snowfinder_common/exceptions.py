@@ -13,6 +13,11 @@ class SnowfinderError(Exception):
     """
 
     def __init__(self, message: str, context: dict[str, object] | None = None) -> None:
+        """Initialise with a human-readable *message* and optional *context* dict.
+
+        *context* is shallow-copied so callers cannot mutate the stored dict
+        after construction.
+        """
         super().__init__(message)
         self.context: dict[str, object] = dict(context) if context else {}
 

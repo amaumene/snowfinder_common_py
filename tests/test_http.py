@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, call, patch
 import requests
 import pytest
 
+from snowfinder_common.exceptions import FetchError
 from snowfinder_common.http import _validate_retry_config, download_file
 
 
@@ -116,7 +117,7 @@ class TestDownloadFileRetries:
         assert result is True
         assert mock_get.call_count == 2
 
-    def test_returns_false_after_exhausting_retries(self, tmp_path):
+    def test_raises_fetch_error_after_exhausting_retries(self, tmp_path):
         dest = tmp_path / "fail.bin"
         fail_resp = _make_mock_response(503)
 
@@ -127,9 +128,9 @@ class TestDownloadFileRetries:
             ) as mock_get,
             patch("snowfinder_common.http.time.sleep"),
         ):
-            result = download_file("http://example.com/fail.bin", str(dest), max_retries=3)
+            with pytest.raises(FetchError):
+                download_file("http://example.com/fail.bin", str(dest), max_retries=3)
 
-        assert result is False
         assert mock_get.call_count == 3
 
     def test_retry_delay_is_linear_backoff(self, tmp_path):
@@ -140,12 +141,13 @@ class TestDownloadFileRetries:
             patch("snowfinder_common.http.requests.get", return_value=fail_resp),
             patch("snowfinder_common.http.time.sleep") as mock_sleep,
         ):
-            download_file(
-                "http://example.com/backoff.bin",
-                str(dest),
-                max_retries=3,
-                retry_delay_s=2.0,
-            )
+            with pytest.raises(FetchError):
+                download_file(
+                    "http://example.com/backoff.bin",
+                    str(dest),
+                    max_retries=3,
+                    retry_delay_s=2.0,
+                )
 
         # After attempt 0 → sleep(2.0*1=2.0), after attempt 1 → sleep(2.0*2=4.0)
         # No sleep after the last attempt
@@ -160,12 +162,13 @@ class TestDownloadFileRetries:
             patch("snowfinder_common.http.requests.get", return_value=fail_resp),
             patch("snowfinder_common.http.time.sleep") as mock_sleep,
         ):
-            download_file(
-                "http://example.com/nofinal.bin",
-                str(dest),
-                max_retries=1,
-                retry_delay_s=5.0,
-            )
+            with pytest.raises(FetchError):
+                download_file(
+                    "http://example.com/nofinal.bin",
+                    str(dest),
+                    max_retries=1,
+                    retry_delay_s=5.0,
+                )
 
         mock_sleep.assert_not_called()
 
@@ -183,7 +186,7 @@ class TestDownloadFileRetries:
 
 
 class TestDownloadFileOsError:
-    def test_oserror_returns_false(self, tmp_path):
+    def test_oserror_raises_fetch_error(self, tmp_path):
         # Use a directory as dest_path to provoke IsADirectoryError (an OSError subclass)
         dest = str(tmp_path)  # writing to a directory path raises IsADirectoryError
         ok_resp = _make_mock_response(200, [b"data"])
@@ -192,9 +195,9 @@ class TestDownloadFileOsError:
             patch("snowfinder_common.http.requests.get", return_value=ok_resp),
             patch("snowfinder_common.http.time.sleep") as mock_sleep,
         ):
-            result = download_file("http://example.com/file.bin", dest)
+            with pytest.raises(FetchError):
+                download_file("http://example.com/file.bin", dest)
 
-        assert result is False
         mock_sleep.assert_has_calls([call(2.0), call(4.0)])
 
     def test_oserror_is_retried_and_does_not_leave_destination_file(self, tmp_path):
@@ -203,11 +206,37 @@ class TestDownloadFileOsError:
         ok_resp = _make_mock_response(200, [b"x"])
 
         with patch("snowfinder_common.http.requests.get", return_value=ok_resp) as mock_get:
-            result = download_file(url, dest, max_retries=2)
+            with pytest.raises(FetchError):
+                download_file(url, dest, max_retries=2)
 
-        assert result is False
         assert mock_get.call_count == 2
         assert tmp_path.is_dir()
+
+
+class TestDownloadFileFetchError:
+    def test_fetch_error_carries_url_and_attempts_context(self, tmp_path):
+        dest = tmp_path / "fail.bin"
+        fail_resp = _make_mock_response(503)
+
+        with (
+            patch("snowfinder_common.http.requests.get", return_value=fail_resp),
+            patch("snowfinder_common.http.time.sleep"),
+        ):
+            with pytest.raises(FetchError) as exc_info:
+                download_file("http://example.com/fail.bin", str(dest), max_retries=2)
+
+        assert exc_info.value.context["url"] == "http://example.com/fail.bin"
+        assert exc_info.value.context["attempts"] == 2
+
+    def test_fetch_error_not_raised_on_404(self, tmp_path):
+        dest = tmp_path / "missing.bin"
+        mock_resp = _make_mock_response(404)
+        mock_resp.raise_for_status.return_value = None
+
+        with patch("snowfinder_common.http.requests.get", return_value=mock_resp):
+            result = download_file("http://example.com/missing.bin", str(dest))
+
+        assert result is False  # 404 → False, not FetchError
 
 
 class TestValidateRetryConfig:
@@ -216,7 +245,7 @@ class TestValidateRetryConfig:
         [
             (
                 {"max_retries": -1, "retry_delay_s": 1.0, "timeout_s": 1.0},
-                "max_retries must be non-negative",
+                "max_retries must be at least 1",
             ),
             (
                 {"max_retries": 1, "retry_delay_s": 0.0, "timeout_s": 1.0},

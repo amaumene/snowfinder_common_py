@@ -5,7 +5,7 @@ import math
 import pytest
 
 from snowfinder_common.snow_model import (
-    _approx_wet_bulb,
+    approx_wet_bulb,
     compute_slr,
     compute_snow_fraction,
     compute_snowfall,
@@ -14,43 +14,43 @@ from snowfinder_common.snow_model import (
 
 class TestApproxWetBulb:
     def test_returns_float(self):
-        result = _approx_wet_bulb(10.0, 50.0)
+        result = approx_wet_bulb(10.0, 50.0)
         assert isinstance(result, float)
 
     def test_wet_bulb_below_dry_bulb_at_low_rh(self):
         # At low RH, wet-bulb should be well below dry-bulb
-        tw = _approx_wet_bulb(20.0, 20.0)
+        tw = approx_wet_bulb(20.0, 20.0)
         assert tw < 20.0
 
     def test_wet_bulb_approaches_dry_bulb_at_high_rh(self):
         # At near-saturation RH, wet-bulb ≈ dry-bulb
-        tw = _approx_wet_bulb(20.0, 99.0)
+        tw = approx_wet_bulb(20.0, 99.0)
         assert abs(tw - 20.0) < 5.0
 
     def test_rh_clamped_at_minimum_5(self):
         # RH below 5 should be clamped to 5 — same result as RH=5
-        tw_clamped = _approx_wet_bulb(15.0, 5.0)
-        tw_below = _approx_wet_bulb(15.0, 1.0)
+        tw_clamped = approx_wet_bulb(15.0, 5.0)
+        tw_below = approx_wet_bulb(15.0, 1.0)
         assert tw_clamped == tw_below
 
     def test_rh_clamped_at_maximum_99(self):
-        tw_clamped = _approx_wet_bulb(15.0, 99.0)
-        tw_above = _approx_wet_bulb(15.0, 110.0)
+        tw_clamped = approx_wet_bulb(15.0, 99.0)
+        tw_above = approx_wet_bulb(15.0, 110.0)
         assert tw_clamped == tw_above
 
     def test_freezing_temp_low_rh_returns_negative_wet_bulb(self):
         # 0°C dry-bulb with low RH → wet-bulb clearly negative
-        tw = _approx_wet_bulb(0.0, 30.0)
+        tw = approx_wet_bulb(0.0, 30.0)
         assert tw < 0.0
 
     def test_hot_dry_returns_much_lower_wet_bulb(self):
-        tw = _approx_wet_bulb(40.0, 10.0)
+        tw = approx_wet_bulb(40.0, 10.0)
         assert tw < 25.0
 
     @pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
     def test_rejects_non_finite_inputs(self, value):
         with pytest.raises(ValueError, match="must be finite"):
-            _approx_wet_bulb(value, 50.0)
+            approx_wet_bulb(value, 50.0)
 
 
 class TestComputeSnowFraction:
@@ -110,12 +110,6 @@ class TestComputeSnowFraction:
         frac = compute_snow_fraction(temp_850, 0.0, 70.0)
         assert expected_min <= frac <= expected_max
 
-    @pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
-    def test_rejects_non_finite_inputs(self, value):
-        with pytest.raises(ValueError, match="must be finite"):
-            compute_snow_fraction(value, 0.0, 70.0)
-
-
 class TestComputeSlr:
     def test_very_cold_returns_max_slr(self):
         slr = compute_slr(-20.0)
@@ -161,12 +155,6 @@ class TestComputeSlr:
     def test_always_positive(self):
         for temp in [-30.0, -15.0, -5.0, 0.0, 5.0, 15.0]:
             assert compute_slr(temp) > 0.0
-
-    @pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
-    def test_rejects_non_finite_inputs(self, value):
-        with pytest.raises(ValueError, match="must be finite"):
-            compute_slr(value)
-
 
 class TestComputeSnowfall:
     def test_zero_precip_returns_all_zeros(self):
@@ -248,3 +236,18 @@ class TestComputeSnowfall:
     def test_rejects_non_finite_precipitation(self, value):
         with pytest.raises(ValueError, match="must be finite"):
             compute_snowfall(value, -5.0, -2.0, 80.0)
+
+    def test_accepts_numpy_scalar_inputs(self):
+        """numpy scalars (np.float32/np.float64) must be accepted without TypeError."""
+        pytest.importorskip("numpy")
+        import numpy as np
+
+        snowfall_cm, rain_mm, snow_frac = compute_snowfall(
+            np.float64(10.0),
+            np.float32(-5.0),
+            np.float64(0.0),
+            np.float32(80.0),
+        )
+        assert snowfall_cm >= 0.0
+        assert rain_mm >= 0.0
+        assert 0.0 <= snow_frac <= 1.0

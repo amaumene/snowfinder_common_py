@@ -23,7 +23,7 @@ import logging
 import sqlite3
 import threading
 from contextlib import contextmanager
-from collections.abc import Generator
+from collections.abc import Iterator
 from typing import Self
 
 from .exceptions import DatabaseError
@@ -58,37 +58,42 @@ class Database:
             )
         self._database_path = database_path
         self._conn: sqlite3.Connection | None = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     # ------------------------------------------------------------------
     # Connection lifecycle
     # ------------------------------------------------------------------
 
+    def _ensure_connected(self) -> None:
+        """Set up the connection if not already connected. Caller MUST hold self._lock."""
+        if self._conn is not None:
+            return
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = sqlite3.connect(
+                self._database_path,
+                check_same_thread=False,
+            )
+            conn.row_factory = _dict_factory
+            # Performance and safety pragmas
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA busy_timeout = 5000")
+            conn.execute("PRAGMA synchronous = NORMAL")
+            self._conn = conn
+            logger.debug("Database connection established: %s", self._database_path)
+        except sqlite3.Error as exc:
+            if conn is not None:
+                conn.close()
+            raise DatabaseError(
+                f"Failed to open database: {exc}",
+                context={"path": self._database_path},
+            ) from exc
+
     def connect(self) -> None:
         """Open the database connection (idempotent if already open)."""
         with self._lock:
-            if self._conn is None:
-                conn: sqlite3.Connection | None = None
-                try:
-                    conn = sqlite3.connect(
-                        self._database_path,
-                        check_same_thread=False,
-                    )
-                    conn.row_factory = _dict_factory
-                    # Performance and safety pragmas
-                    conn.execute("PRAGMA journal_mode = WAL")
-                    conn.execute("PRAGMA foreign_keys = ON")
-                    conn.execute("PRAGMA busy_timeout = 5000")
-                    conn.execute("PRAGMA synchronous = NORMAL")
-                    self._conn = conn
-                    logger.debug("Database connection established: %s", self._database_path)
-                except sqlite3.Error as exc:
-                    if conn is not None:
-                        conn.close()
-                    raise DatabaseError(
-                        f"Failed to open database: {exc}",
-                        context={"path": self._database_path},
-                    ) from exc
+            self._ensure_connected()
 
     def close(self) -> None:
         """Close the database connection (idempotent if already closed)."""
@@ -103,7 +108,7 @@ class Database:
     # ------------------------------------------------------------------
 
     @contextmanager
-    def cursor(self) -> Generator[sqlite3.Cursor, None, None]:
+    def cursor(self) -> Iterator[sqlite3.Cursor]:
         """Yield a cursor, committing on success or rolling back on error.
 
         Rolls back the current transaction and logs a warning if an exception
@@ -114,10 +119,9 @@ class Database:
         sqlite3.Cursor
             A cursor whose rows are returned as dicts.
         """
-        self.connect()
-        if self._conn is None:
-            raise RuntimeError("unreachable: connect() succeeded but _conn is None")
         with self._lock:
+            self._ensure_connected()
+            assert self._conn is not None  # guaranteed by _ensure_connected
             cur = self._conn.cursor()
             try:
                 yield cur
@@ -149,10 +153,9 @@ class Database:
         VACUUM cannot run inside a transaction, so this commits any pending
         work and temporarily switches to autocommit mode.
         """
-        self.connect()
-        if self._conn is None:
-            raise RuntimeError("unreachable: connect() succeeded but _conn is None")
         with self._lock:
+            self._ensure_connected()
+            assert self._conn is not None  # guaranteed by _ensure_connected
             logger.debug("VACUUM")
             self._conn.commit()
             old_isolation = self._conn.isolation_level

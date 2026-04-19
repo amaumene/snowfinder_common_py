@@ -1,15 +1,19 @@
 """Shared HTTP utilities for snowfinder services.
 
 Provides a robust ``download_file()`` helper with retry logic and
-structured logging, extracted from the MSM fetcher in snowfinder_predictor.
+structured logging.
 """
 
+import contextlib
 import logging
 import os
 import tempfile
 import time
+from pathlib import Path
 
 import requests
+
+from .exceptions import FetchError
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +39,10 @@ def download_file(
     """Download a file from *url* to *dest_path* with automatic retries.
 
     On success the file is written to *dest_path* and ``True`` is returned.
-    On a permanent failure (e.g. HTTP 404) or after exhausting all retries,
-    ``False`` is returned — a :class:`~snowfinder_common.exceptions.FetchError`
-    is **not** raised so that callers can treat missing files as optional.
+    On a clean HTTP 404 (data genuinely missing), ``False`` is returned
+    without retrying — callers can treat this as an optional/absent file.
+    On any other failure after exhausting all retries, a
+    :class:`~snowfinder_common.exceptions.FetchError` is raised.
 
     Progress messages are emitted at ``DEBUG`` level; control visibility via
     ``LOG_LEVEL`` env var or ``configure_logging(verbose=True)``.
@@ -59,13 +64,14 @@ def download_file(
     Returns
     -------
     bool
-        ``True`` if the file was downloaded successfully, ``False`` otherwise.
+        ``True`` if the file was downloaded successfully, ``False`` if the
+        server returned HTTP 404 (resource genuinely absent).
 
     Raises
     ------
     FetchError
-        Only raised for unexpected programming errors (e.g. ``dest_path``
-        directory does not exist).  Network failures are returned as ``False``.
+        When all retry attempts are exhausted due to network errors,
+        non-404 HTTP errors, or OS-level I/O failures.
     """
     _validate_retry_config(max_retries, retry_delay_s, timeout_s)
     filename = url.split("/")[-1] or url
@@ -76,19 +82,25 @@ def download_file(
             if attempt == 0:
                 logger.debug("Downloading %s …", filename)
 
-            dest_dir = os.path.dirname(dest_path) or "."
+            dest_dir = Path(dest_path).parent or Path(".")
             with tempfile.NamedTemporaryFile(mode="wb", delete=False, dir=dest_dir) as tmp_fh:
                 temp_path = tmp_fh.name
 
+                body_deadline = time.monotonic() + 5 * timeout_s
                 with requests.get(url, timeout=timeout_s, stream=True) as resp:
                     if resp.status_code == 404:
                         logger.debug("Not found (HTTP 404): %s", url)
                         os.unlink(temp_path)
+                        temp_path = None  # prevent double-unlink in finally
                         return False
 
                     resp.raise_for_status()
 
                     for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        if time.monotonic() > body_deadline:
+                            raise requests.Timeout(
+                                f"body read exceeded {5 * timeout_s:.0f}s for {url}"
+                            )
                         if chunk:
                             tmp_fh.write(chunk)
 
@@ -117,7 +129,7 @@ def download_file(
                 url,
                 exc,
             )
-        except (OSError, TimeoutError) as exc:
+        except OSError as exc:
             logger.warning(
                 "Download error on attempt %d/%d for %s: %s",
                 attempt + 1,
@@ -127,8 +139,6 @@ def download_file(
             )
         finally:
             if temp_path is not None:
-                import contextlib
-
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(temp_path)
 
@@ -137,5 +147,12 @@ def download_file(
             logger.debug("Retrying in %.1f s …", delay)
             time.sleep(delay)
 
-    logger.error("Download failed after %d attempts: %s", max_retries, url)
-    return False
+    logger.error(
+        "Download failed after %d attempts: %s",
+        max_retries,
+        url,
+    )
+    raise FetchError(
+        f"Download failed after {max_retries} attempts: {url}",
+        context={"url": url, "attempts": max_retries},
+    )

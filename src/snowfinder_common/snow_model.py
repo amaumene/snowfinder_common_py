@@ -7,21 +7,30 @@ wet-bulb adjustments. Snow-to-liquid ratio (SLR) is temperature-dependent.
 
 import math
 import logging
+import numbers
+
+
+__all__ = [
+    "approx_wet_bulb",
+    "compute_slr",
+    "compute_snow_fraction",
+    "compute_snowfall",
+]
 
 
 logger = logging.getLogger(__name__)
 
 
-def _validate_numeric(value: int | float, name: str) -> None:
+def _validate_numeric(value: object, name: str) -> None:
     if isinstance(value, bool):
         raise TypeError(f"{name} must be numeric, got {type(value).__name__}")
-    if not isinstance(value, (int, float)):
+    if not isinstance(value, numbers.Real):
         raise TypeError(f"{name} must be numeric, got {type(value).__name__}")
-    if math.isnan(value) or math.isinf(value):
+    if not math.isfinite(float(value)):
         raise ValueError(f"{name} must be finite, got {value}")
 
 
-def _approx_wet_bulb(temp_c: float, rh_pct: float) -> float:
+def approx_wet_bulb(temp_c: float, rh_pct: float) -> float:
     """Approximate wet-bulb temperature using Stull (2011) formula.
 
     Valid for RH 5-99% and temp -20 to 50°C.
@@ -56,10 +65,10 @@ def compute_snow_fraction(
     Secondary adjustment: surface wet-bulb temperature
     - If surface wet-bulb < 0°C, boost snow fraction
     - If surface wet-bulb > 3°C, reduce snow fraction
+
+    Callers are responsible for passing finite numeric values; validation is
+    performed only at the public ``compute_snowfall`` boundary.
     """
-    _validate_numeric(temp_850_c, "temp_850_c")
-    _validate_numeric(temp_surface_c, "temp_surface_c")
-    _validate_numeric(rh_surface_pct, "rh_surface_pct")
 
     # Primary: 850hPa temperature linear ramp
     if temp_850_c <= -2.0:
@@ -70,7 +79,7 @@ def compute_snow_fraction(
         frac = 1.0 - (temp_850_c + 2.0) / 4.0
 
     # Secondary: surface wet-bulb adjustment
-    wet_bulb = _approx_wet_bulb(temp_surface_c, rh_surface_pct)
+    wet_bulb = approx_wet_bulb(temp_surface_c, rh_surface_pct)
     if wet_bulb < 0.0:
         # Cold surface boosts snow probability
         boost = min(0.2, -wet_bulb * 0.05)
@@ -92,8 +101,10 @@ def compute_slr(temp_850_c: float) -> float:
     - Moderate (-5°C): ~10:1 (standard)
     - Near freezing (0°C): ~8:1 (wet/heavy)
     - Warm (> 0°C): ~6:1
+
+    Callers are responsible for passing finite numeric values; validation is
+    performed only at the public ``compute_snowfall`` boundary.
     """
-    _validate_numeric(temp_850_c, "temp_850_c")
     if temp_850_c <= -15.0:
         return 1.5  # 15:1 ratio (cm per mm)
     elif temp_850_c <= -10.0:

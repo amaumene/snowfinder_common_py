@@ -14,6 +14,9 @@ dev = [
     "ruff>=0.8",
     "mypy>=1.10",
 ]
+json-logging = [
+    "python-json-logger>=3.0",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -38,5 +41,4 @@ disallow_untyped_defs = true
 [dependency-groups]
 dev = [
     "pytest>=9.0.3",
-    "requests>=2.33.1",
 ]

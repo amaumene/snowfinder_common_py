@@ -22,6 +22,8 @@ import os
 import sys
 import time
 from collections.abc import Callable
+from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -33,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 def run_service(
     service_name: str,
-    pipeline_fn: Callable[..., None],
+    pipeline_fn: Callable[[Any, argparse.Namespace], None],
     *,
     db_class: type[_BaseDatabase] = _BaseDatabase,
     setup_parser: Callable[[argparse.ArgumentParser], None] | None = None,
@@ -70,7 +72,7 @@ def run_service(
     args = parser.parse_args()
 
     if args.database_path is not None:
-        args.database_path = args.database_path.strip()
+        args.database_path = str(Path(args.database_path.strip()).expanduser())
 
     configure_logging(verbose=args.verbose)
 
@@ -84,7 +86,7 @@ def run_service(
         with db_class(args.database_path) as db:
             pipeline_fn(db, args)
     except Exception as exc:
-        logger.error("%s failed: %s", service_name.title(), exc, exc_info=True)
+        logger.error("%s failed", service_name.title(), exc_info=True)
         sys.exit(1)
 
     elapsed = time.monotonic() - start

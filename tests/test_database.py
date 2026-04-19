@@ -366,3 +366,80 @@ class TestDatabaseDoubleConnect:
             assert db._conn is first_conn
         finally:
             db.close()
+
+
+class TestDatabaseErrorPaths:
+    def test_health_check_returns_false_on_corrupted_db(self, tmp_path):
+        """health_check returns False when the query itself raises."""
+        db_path = str(tmp_path / "corrupt.db")
+        # Write garbage so sqlite3 raises OperationalError on connect/query
+        with open(db_path, "wb") as f:
+            f.write(b"not a sqlite database\x00" * 10)
+        db = Database(db_path)
+        # health_check must not raise — it should return False and log
+        assert db.health_check() is False
+
+    def test_cursor_commit_raises_sqlite_error_triggers_rollback(self, tmp_path):
+        """When commit() raises sqlite3.Error, rollback is called and DatabaseError is raised."""
+        from unittest.mock import MagicMock
+
+        db = Database(str(tmp_path / "test.db"))
+        db.connect()
+        try:
+            rollback_called = []
+
+            # Replace the internal connection with a mock that raises on commit.
+            # MagicMock (no spec) allows attribute assignment freely.
+            mock_conn = MagicMock()
+            mock_conn.cursor.return_value = MagicMock()
+            mock_conn.commit.side_effect = sqlite3.OperationalError("disk full")
+            mock_conn.rollback.side_effect = lambda: rollback_called.append(True)
+
+            db._conn = mock_conn
+
+            with pytest.raises(DatabaseError, match="Database operation failed"):
+                with db.cursor():
+                    pass  # commit() is called on context-manager exit
+
+            assert rollback_called, "rollback() was not called after commit() raised"
+        finally:
+            db._conn = None  # prevent close() from calling mock_conn.close()
+
+    def test_vacuum_under_load_isolation_swap(self, tmp_path):
+        """vacuum() can run while another thread holds a cursor (RLock allows re-entry from same thread; different thread must wait)."""
+        db = Database(str(tmp_path / "test.db"))
+        db.connect()
+
+        errors = []
+
+        def run_vacuum():
+            try:
+                db.vacuum()
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        # Run vacuum from a separate thread — it should complete without deadlock
+        t = threading.Thread(target=run_vacuum)
+        t.start()
+        t.join(timeout=5.0)
+
+        assert not t.is_alive(), "vacuum() deadlocked"
+        assert not errors, f"vacuum() raised: {errors}"
+        db.close()
+
+    def test_reentrant_lock_does_not_deadlock(self, tmp_path):
+        """Same-thread nested cursor() inside health_check completes within 2s."""
+        db = Database(str(tmp_path / "test.db"))
+        db.connect()
+
+        import time
+
+        start = time.monotonic()
+        # health_check calls cursor() internally; calling it from the main thread
+        # exercises the RLock re-entrancy path (no deadlock expected).
+        result = db.health_check()
+        elapsed = time.monotonic() - start
+
+        assert result is True
+        assert elapsed < 2.0, f"health_check took {elapsed:.2f}s — possible deadlock"
+        db.close()

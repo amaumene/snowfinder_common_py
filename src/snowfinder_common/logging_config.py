@@ -11,10 +11,10 @@ The ``LOG_LEVEL`` environment variable (``DEBUG``, ``INFO``, ``WARNING``,
 ``ERROR`` — case-insensitive) takes precedence over the *verbose* parameter
 when set.
 
-JSON output requires the ``python-json-logger`` package
-(``pip install python-json-logger``).  If the package is not installed and
-``json_output=True`` is requested, a warning is emitted and the plain-text
-formatter is used as a fallback.
+JSON output requires the ``python-json-logger`` package, declared as an
+optional dependency (``pip install snowfinder-common[json-logging]``).
+If the package is not installed and ``json_output=True`` is requested,
+a warning is emitted and the plain-text formatter is used as a fallback.
 """
 
 import logging
